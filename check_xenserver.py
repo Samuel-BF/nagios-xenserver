@@ -333,6 +333,7 @@ def check_hosts(session, args):
 
     sys.exit(exit)
 
+
 def check_cpu(session, args):
 
     warning = args["warning"]
@@ -382,6 +383,191 @@ def check_cpu(session, args):
     sys.exit(exitcode)
 
 
+def vm_cpu(session, args):
+
+    warning = args["warning"]
+    critical = args["critical"]
+
+    import parse_rrd
+    params = {}
+
+    if not args['vm_name']:
+        vm_list = session.xenapi.VM.get_all()
+    else:
+        vm_list  = session.xenapi.VM.get_by_name_label(args['vm_name'])
+
+    params["cf"] = "AVERAGE"
+    params["start"] = int(time.time()) - 30
+    params["interval"] = 5
+    params["host"] = "false"
+
+    perfdata = {}
+    warning_vms = []
+    critical_vms = []
+    unknown_cpu_vms = []
+
+    host = session.xenapi.session.get_this_host(session.handle)
+    url = args["scheme"]+args["host"]
+    rrd_updates = parse_rrd.RRDUpdates()
+    rrd_updates.refresh(session.handle, params, url)
+    latest_row = get_latest_row(rrd_updates)
+
+    perf = 0
+    finalexit = 0
+    globalperf = 0
+    for vm_cur in vm_list:
+        record = session.xenapi.VM.get_record(vm_cur)
+        if not(record["is_a_template"]) and not(record["is_control_domain"]) and record["power_state"] == "Running":
+            vm_uuid = record["uuid"]
+	    vm_name = record["name_label"]
+            perfdata[vm_name] = {'service' : '', 'perf': ''}
+            v = []
+            for cpu in [x for x in rrd_updates.get_vm_param_list(vm_uuid) if x[:3] == 'cpu']:
+                data = str(rrd_updates.get_vm_data(vm_uuid, cpu, latest_row))
+                v.append(100*float(data))
+		perfdata[vm_name]['perf'] += " '" + vm_name + "_used_{}'={:.1f}%;{};{}".format(cpu, 100*float(data), warning, critical)
+            if len(v):
+                perf = reduce(lambda x,y: x+y, v)/len(v)
+		globalperf += perf
+		perfdata[vm_name]['service'] = vm_name + " used CPU = {:.1f}%".format(perf)
+		if len(v) > 1:
+		    perfdata[vm_name]['perf'] = '\'' + vm_name + "_used_cpu\'={:.1f}%;{};{}".format(perf, warning, critical) + perfdata[vm_name]['perf']
+		else:
+		    perfdata[vm_name]['perf'] = "'" + vm_name + "_used_cpu'={:.1f}%;{};{}".format(perf, warning, critical)
+		if perf > critical:
+		    exitcode = 2
+		    critical_vms.append(vm_name)
+		elif perf > warning:
+		    exitcode = 1
+		    warning_vms.append(vm_name)
+		else:
+		    exitcode = 0
+            else:
+	        perfdata[vm_name]["service"] = vm_name + " : CPU unknown"
+		exitcode = 3
+		unknown_cpu_vms.append(vm_name)
+	    if exitcode > finalexit:
+	        finalexit = exitcode
+
+    if len(vm_list) > len(unknown_cpu_vms): 
+        globalperf = globalperf / (len(vm_list) - len(unknown_cpu_vms))
+    if len(perfdata) == 0:
+        print "CRITICAL | VM not found or not alive"
+        sys.exit(2)
+
+    performance = "Total_used_cpu={:.1f}%;{};{}".format(globalperf, warning, critical)
+
+    if finalexit == 3:
+        prefix = "UNKNOWN: CPU"
+    elif finalexit == 2:
+        prefix = "CRITICAL: CPU"
+    elif finalexit == 1:
+        prefix = "WARNING: CPU"
+    else:
+        prefix = 'OK: CPU'
+
+    if len(perfdata) > 1:
+        if len(unknown_cpu_vms):
+	    prefix += " / Unknown on VMs = ["+", ".join(unknown_cpu_vms)+"]"
+        if len(critical_vms):
+	    prefix += " / Critical on VMs = ["+", ".join(critical_vms)+"]"
+        if len(warning_vms):
+	    prefix += " / Warning on VMs = ["+", ".join(warning_vms)+"]"
+        print prefix + ";\n" + ";\n".join([perfdata[vm]["service"] for vm in perfdata]) +	";\n|" + performance + " " + " ".join([perfdata[vm]["perf"] for vm in perfdata])
+    else:
+        vm = perfdata.values()[0]
+        print prefix + " : " + vm["service"] + "; |" + vm["perf"]
+
+    sys.exit(finalexit)
+
+
+def vm_mem(session, args):
+
+    warning = args['warning']
+    critical = args['critical']
+
+    import parse_rrd
+    params = {}
+
+    if not args['vm_name']:
+        vm_list = session.xenapi.VM.get_all()
+    else:
+        vm_list  = session.xenapi.VM.get_by_name_label(args['vm_name'])
+
+    params["cf"] = "AVERAGE"
+    params["start"] = int(time.time()) - 30
+    params["interval"] = 5
+    params["host"] = "false"
+
+    host = session.xenapi.session.get_this_host(session.handle)
+    url = args["scheme"]+args["host"]
+    rrd_updates = parse_rrd.RRDUpdates()
+    rrd_updates.refresh(session.handle, params, url)
+    latest_row = get_latest_row(rrd_updates)
+
+    finalexit = 0
+    global_total = 0
+    perfdata = {}
+    warning_vms = []
+    critical_vms = []
+    unknown_vms = []
+    perf = 0
+    for vm_cur in vm_list:
+        record = session.xenapi.VM.get_record(vm_cur)
+        if not(record["is_a_template"]) and not(record["is_control_domain"]) and record["power_state"] == "Running":
+            vm_uuid = record["uuid"]
+	    vm_name = record["name_label"]
+            perfdata[vm_name] = {'service' : '', 'perf': ''}
+	    mem_total = rrd_updates.get_vm_data(vm_uuid, "memory", latest_row)
+	    global_total += mem_total
+	    # On VMs lacking xentools, there is no 'memory_internal_free' field
+	    try:
+	        # memory_internal_free is in KB while memory is in Bytes (according to https://wiki.xenproject.org/wiki/XAPI_RRDs)
+	        mem_free = 1024 * rrd_updates.get_vm_data(vm_uuid, "memory_internal_free", latest_row)    
+                used_percent, perfdata[vm_name], total, alloc = compute(vm_name, mem_total, str(int(mem_total) - int(mem_free)), mem_free, warning, critical, args["perfdata"], "_used_mem")
+	        if float(used_percent) > float(critical):
+		    exitcode = 2
+		    critical_vms.append(vm_name)
+	        elif float(used_percent) > float(warning):
+		    exitcode = 1
+		    warning_vms.append(vm_name)
+                else:
+		    exitcode = 0
+	    except KeyError:
+	        perfdata[vm_name]["service"] = vm_name + " : RAM usage unknown"
+		perfdata[vm_name]["performance"] = ""
+		exitcode = 3
+		unknown_vms.append(vm_name)
+
+	    if exitcode > finalexit:
+	        finalexit = exitcode
+
+    performance = "Total_affected_ram={:.1f}B;".format(global_total)
+
+    if finalexit == 3:
+        prefix = "UNKNOWN: RAM"
+    elif finalexit == 2:
+        prefix = "CRITICAL: RAM"
+    elif finalexit == 1:
+        prefix = "WARNING: RAM"
+    else:
+        prefix = "OK: RAM"
+
+    if len(perfdata) > 1:
+        if len(unknown_vms):
+            prefix += " / Unknown on VMs = ["+", ".join(unknown_vms)+"]"
+        if len(critical_vms):
+            prefix += " / Critical on VMs = ["+", ".join(critical_vms)+"]"
+        if len(warning_vms):
+            prefix += " / Warning on VMs = ["+", ".join(warning_vms)+"]"
+        print prefix + ";\n" + ";\n".join([perfdata[vm]["service"] for vm in perfdata]) +	";\n|" + performance + " " + " ".join([perfdata[vm]["performance"] for vm in perfdata])
+    else:
+        vm = perfdata.values()[0]
+        print prefix + " : " + vm["service"] + "; |" + vm["performance"]
+
+    sys.exit(finalexit)
+
+
 if __name__ == "__main__":
 
     ### Arguments definition ###
@@ -416,6 +602,13 @@ if __name__ == "__main__":
     #Check cpu parser
     parser_cpu = subparsers.add_parser("check_cpu",help="Check cpu usage", parents=[common_parser])
 
+    #Check vm_cpu parser
+    parser_vm_cpu = subparsers.add_parser('vm_cpu', help='Check CPU utilisation of a VM or all VMs', parents=[common_parser])
+    parser_vm_cpu.add_argument('-n', '--name', help='Optionnaly check a specific VM')
+
+    #Check vm_mem parser
+    parser_vm_mem = subparsers.add_parser('vm_mem', help='Check mem usage of a VM or all VMs', parents=[common_parser])
+    parser_vm_mem.add_argument('-n', '--name', help='Optionnaly check a specific VM')
     args = parser.parse_args()
 
     host = args.hostname
@@ -435,6 +628,10 @@ if __name__ == "__main__":
         check_args['warning']  = args.warning
     if hasattr(args,'critical'):
         check_args['critical'] = args.critical
+
+    check_args['vm_name'] = ''
+    if (args.check == 'vm_cpu' or args.check == 'vm_mem') and hasattr(args, 'name'):
+        check_args['vm_name'] = args.name
 
     check_args['exclude_srs'] = []
     if args.check == "check_sr" and hasattr(args, "name"):
@@ -467,7 +664,9 @@ if __name__ == "__main__":
         "check_sr": check_sr,
         "check_mem": check_mem,
         "check_hosts": check_hosts,
-        "check_cpu": check_cpu
+        "check_cpu": check_cpu,
+        "vm_cpu": vm_cpu,
+        "vm_mem": vm_mem
     }
 
     options[args.check](session,check_args)
