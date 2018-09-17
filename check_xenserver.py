@@ -87,11 +87,8 @@ def performancedata(sr_name, suffix, total, alloc, warning, critical, performanc
             str(humanize_bytes(critical, precision=1, suffix=True, format=performancedata_format)).replace(".",",") + ";0.00;" + \
             str(humanize_bytes(total,    precision=1, suffix=True, format=performancedata_format)).replace(".",",") +""
     else:
-        performance_line = "'"+sr_name + suffix + "'=" + \
-            str(alloc).replace(".",",") + "B;" + \
-            str(warning).replace(".",",")+ ";" + \
-            str(critical).replace(".",",") + ";0;" + \
-            str(total).replace(".",",") +""
+        performance_line = "'{}{}'={:d}B;{:d};{:d};0;{:d}".format(
+	    sr_name, suffix, int(round(alloc)), int(round(warning)), int(round(critical)), int(round(total)))
 
     return(performance_line)
 
@@ -99,10 +96,10 @@ def compute(name, size, util, free, warning, critical, performancedata_format, f
 
     total_bytes_b    = int(size)
     total_alloc_b    = int(util)
-    free_space_b	 = int(free)
+    free_space_b     = int(free)
     used_percent     = 100*float(total_alloc_b)/float(total_bytes_b)
-    warning_b        = int((int(total_bytes_b)    / 100) * float(warning))
-    critical_b       = int((float(total_bytes_b)  / 100) * float(critical))
+    warning_b        = 0.01*total_bytes_b*warning
+    critical_b       = 0.01*total_bytes_b*critical
 
     info = {}
     info['performance'] = performancedata(name, format_suffix,
@@ -196,25 +193,31 @@ def check_sr(session, args):
 
     if finalexit == 2:
         prefix = "CRITICAL: SR Space"
-        prefix += " / Critical SRs = ["+", ".join(critical_srs)+"]"
-        prefix += " / Warning SRs = ["+", ".join(warning_srs)+"]"
     elif finalexit == 1:
         prefix = "WARNING: SR Space"
-        prefix += " / Warning SRs = ["+", ".join(warning_srs)+"]"
     else:
         prefix = "OK: SR Space"
 
-
-    print prefix + ' | ' + performance + "\n" + ";\n".join([output[disk_srs]['service'] for disk_srs in output]) +	"; | " + " ".join([output[disk_srs]['perf'] for disk_srs in output])
+    if len(output) > 1:
+        if len(critical_srs):
+	    prefix += ' / Critical SRs = ['+', '.join(critical_srs)+']'
+        if len(warning_srs):
+	    prefix += ' / Warning SRs = ['+', '.join(warning_srs)+']'
+        print prefix + ';\n' + ';\n'.join([output[disk_srs]['service'] for disk_srs in output]) +	';\n|' + performance + ' ' + ' '.join([output[disk_srs]['perf'] for disk_srs in output])
+    elif len(output) == 1:
+        disk_sr = output.values()[0]
+        print prefix + ' : ' + disk_sr['service'] + '; |' + disk_sr['perf']
+    else:
+        print 'UNKNOWN : ' + args['sr_name'] + ' SR not found'
+        finalexit = 3
 
     sys.exit(finalexit)
 
-def mem(session, host, warning, critical, performancedata_format):
+def mem(hostname, metric, warning, critical, performancedata_format):
 
-    if host:
-        hostname          = session.xenapi.host.get_name_label(host)
-        mem_size          = session.xenapi.host_metrics.get_record(session.xenapi.host.get_record(host)['metrics'])['memory_total']
-        mem_free          = session.xenapi.host_metrics.get_record(session.xenapi.host.get_record(host)['metrics'])['memory_free']
+    if metric:
+        mem_size          = metric['memory_total']
+        mem_free          = metric['memory_free']
 
         used_percent, outputdata , total, alloc = compute(hostname, mem_size, str(int(mem_size) - int(mem_free)), mem_free, warning, critical, performancedata_format, "_used_mem")
 
@@ -235,6 +238,18 @@ def mem(session, host, warning, critical, performancedata_format):
         sys.exit(3)
 
 
+def get_latest_row(rrd_updates):
+    latest_row = 0
+    nrows = rrd_updates.get_nrows()
+    max_time = 0
+    for row in range(nrows):
+        epoch = rrd_updates.get_row_time(row)
+	if epoch > max_time:
+	    max_time = epoch
+	    latest_row = row
+    return latest_row
+
+
 def check_mem(session, args):
 
     warning =args["warning"]
@@ -249,10 +264,12 @@ def check_mem(session, args):
     critical_hosts = []
     warning_hosts = []
 
-    hosts = session.xenapi.host.get_all()
-    for host in hosts:
-        hostname = session.xenapi.host.get_name_label(host)
-        exitcode, status, servicedata, perfdata, total, used = mem(session, host, warning, critical, performancedata_format)
+    hosts = session.xenapi.host.get_all_records()
+    host_metrics = session.xenapi.host_metrics.get_all_records()
+
+    for host_ref, host in hosts.items():
+        hostname = host['name_label']
+        exitcode, status, servicedata, perfdata, total, used = mem(hostname, host_metrics[host['metrics']], warning, critical, performancedata_format)
         if exitcode > finalexit:
             finalexit = exitcode
 
@@ -269,25 +286,29 @@ def check_mem(session, args):
         total_mem += total
         total_used += used
 
-    performance = performancedata("Total", "_mem_used",
+    performance = performancedata('Total', '_mem_used',
                 total_mem,
                 total_used,
-                (total_mem/100)*float(warning),
-                (total_mem/100)*float(critical),
+                total_mem*warning*0.01,
+                total_mem*critical*0.01,
                 performancedata_format)
 
-
     if finalexit == 2:
-        prefix = "CRITICAL: Memory Usage "
-        prefix += " / Critical on Hosts = ["+", ".join(critical_hosts)+"]"
-        prefix += " / Warning on Hosts = ["+", ".join(warning_hosts)+"]"
+        prefix = 'CRITICAL: Memory Usage'
     elif finalexit == 1:
-        prefix = "WARNING: Memory Usage"
-        prefix += " / Warning on Hosts = ["+", ".join(warning_hosts)+"]"
+        prefix = 'WARNING: Memory Usage'
     else:
-        prefix = "OK: Memory Usage"
+        prefix = 'OK: Memory Usage'
 
-    print prefix + " | " + performance + "\n" + ";\n".join([output[hostname]['service'] for hostname in output]) +	"; | " + " ".join([output[hostname]['perf'] for hostname in output])
+    if len(output) > 1:
+        if len(critical_srs):
+	    prefix += ' / Critical on Hosts = ['+', '.join(critical_hosts)+']'
+        if len(warning_srs):
+	    prefix += ' / Warning on Hosts = ['+', '.join(warning_hosts)+']'
+	print prefix + ';\n' + ';\n'.join([output[hostname]['service'] for hostname in output]) +	';\n|' + performance + ' ' + ' '.join([output[hostname]['perf'] for hostname in output])
+    else:
+        hostname = output.values()[0]
+        print prefix + ' : ' + hostname['service'] + '; |' + hostname['perf']
 
     sys.exit(finalexit)
 
@@ -333,19 +354,10 @@ def check_cpu(session, args):
         rrd_updates = parse_rrd.RRDUpdates()
         rrd_updates.refresh(session.handle, params, url)
         paramList = ['cpu'+session.xenapi.host_cpu.get_record(i)['number'] for i in session.xenapi.host_cpu.get_all_records() if host in session.xenapi.host_cpu.get_record(i)['host'] ]
+        latest_row = get_latest_row(rrd_updates)
         for param in rrd_updates.get_host_param_list():
             if param in paramList:
-                max_time=0
-                data = ""
-                for row in range(rrd_updates.get_nrows()):
-                    epoch = rrd_updates.get_row_time(row)
-                    dv = str(rrd_updates.get_host_data(param,row))
-                    if epoch > max_time:
-                        max_time = epoch
-                        data = dv
-                if data == "":
-                    data = 0
-                v.append(float(data))
+                v.append(float(rrd_updates.get_host_data(param, latest_row)))
         perfdata[session.xenapi.host.get_name_label(host)] = reduce(lambda x, y: x+y, v)/len(v)
 
     exitcode = 0
@@ -427,6 +439,7 @@ if __name__ == "__main__":
         check_args['sr_name'] = args.name
 
     # Test if exclude_srs is defined and add the list to the check_args dict
+    check_args["exclude_srs"] = []
     if config.has_option(args.pool,"exclude_srs"):
         exclude_srs = config.get(args.pool,"exclude_srs").split(',')
         [x.strip() for x in exclude_srs]
