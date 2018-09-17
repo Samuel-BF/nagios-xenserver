@@ -350,7 +350,7 @@ def check_cpu(session, args):
     perfdata = {}
     for host in hosts:
         v= []
-        url = scheme+session.xenapi.host.get_address(host)
+        url = args['scheme']+args['host']
         rrd_updates = parse_rrd.RRDUpdates()
         rrd_updates.refresh(session.handle, params, url)
         paramList = ['cpu'+session.xenapi.host_cpu.get_record(i)['number'] for i in session.xenapi.host_cpu.get_all_records() if host in session.xenapi.host_cpu.get_record(i)['host'] ]
@@ -389,10 +389,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     # Top level parser
-    parser.add_argument("pool",help="Pool Name as defined in config file or master IP address")
-    parser.add_argument("config",help="Path to the config file")
+    parser.add_argument("hostname", help="name or IP of host to check")
+    parser.add_argument("login", help="Login for authentication")
+    parser.add_argument("password", help="Password for authentication")
+    parser.add_argument("-s", "--scheme",help="URL scheme (default: https)")
+    parser.add_argument("-f", "--perfdata", help="Performance data output format (pnp4nagios, generic, none)")
 
-    subparsers = parser.add_subparsers(help="checks help", dest="check")
+    subparsers = parser.add_subparsers(help='checks help', dest='check')
 
     # Common top level parser for warning and critical level
     common_parser = argparse.ArgumentParser(add_help=False)
@@ -401,7 +404,8 @@ if __name__ == "__main__":
 
     #Check sr parser
     parser_sr = subparsers.add_parser("check_sr", help="Check for an SR or all SRs", parents=[common_parser])
-    parser_sr.add_argument("--name", help="Optionnaly check a specific SR")
+    parser_sr.add_argument("-n", "--name", help="Optionnaly check a specific SR")
+    parser_sr.add_argument("-x", "--exclude", help="Optionnaly check all SRs but excluded from this list")
 
     #Check mem parser
     parser_mem = subparsers.add_parser("check_mem", help="Check for mem usage on all hosts", parents=[common_parser])
@@ -411,52 +415,45 @@ if __name__ == "__main__":
 
     #Check cpu parser
     parser_cpu = subparsers.add_parser("check_cpu",help="Check cpu usage", parents=[common_parser])
+
     args = parser.parse_args()
 
-    ### Configuration parsing ###
-    import ConfigParser, os
-    config = ConfigParser.ConfigParser()
-    config.readfp(open(args.config))
+    host = args.hostname
 
-    host = config.get(args.pool,'host')
+    if not args.scheme:
+        args.scheme = 'https'
 
-    username = config.get(args.pool,"username")
-    password = config.get(args.pool,"password")
-
-    protocol = config.get(args.pool, "protocol")
+    username = args.login
+    password = args.password
 
     # We store the arguments in a dict to send them to the checks
     check_args = {}
 
-    check_args["perfdata"] = config.get("general","perfdata_format")
+    check_args['perfdata'] = args.perfdata
 
-    if hasattr(args,"warning"):
-        check_args["warning"]  = args.warning
-    if hasattr(args,"critical"):
-        check_args["critical"] = args.critical
+    if hasattr(args,'warning'):
+        check_args['warning']  = args.warning
+    if hasattr(args,'critical'):
+        check_args['critical'] = args.critical
 
+    check_args['exclude_srs'] = []
     if args.check == "check_sr" and hasattr(args, "name"):
         check_args['sr_name'] = args.name
+    if args.check == "check_sr" and args.exclude is not None:
+        check_args['exclude_srs'] = args.exclude.split(",")
+        [x.strip() for x in check_args['exclude_srs']]
 
-    # Test if exclude_srs is defined and add the list to the check_args dict
-    check_args["exclude_srs"] = []
-    if config.has_option(args.pool,"exclude_srs"):
-        exclude_srs = config.get(args.pool,"exclude_srs").split(',')
-        [x.strip() for x in exclude_srs]
-        check_args["exclude_srs"] = exclude_srs
+    check_args['scheme'] = args.scheme + '://'
+    check_args['host'] = host
+
 
     # First acquire a valid session by logging in:
-    if protocol == "https":
-        scheme = "https://"
-    else:
-        scheme = "http://"
-
     try:
-        session = XenAPI.Session(scheme+host)
+        session = XenAPI.Session(args.scheme+'://'+host)
         session.xenapi.login_with_password(username, password)
     except XenAPI.Failure, e:
         if e.details[0] == "HOST_IS_SLAVE":
-            session=XenAPI.Session(scheme+e.details[1])
+            session=XenAPI.Session(args.scheme+'://'+e.details[1])
             session.xenapi.login_with_password(username, password)
         else:
             print "CRITICAL - XenAPI Error : " + e.details[0]
